@@ -127,20 +127,40 @@ void RequestCallbackImpl::processRpc(
       auto& stack = scriptCall.stackRef();
       if (scriptCall.hasOp()) {
         scriptCall.op()->getOperation()(stack);
-      } else {
-        PythonRpcHandler::getInstance()
-            .jitCompilationUnit()
-            ->get_function(scriptCall.qualifiedName())
-            .run(stack);
+        TORCH_INTERNAL_ASSERT(
+            stack.size() == 1,
+            "Return value of a builtin operator or a "
+            "TorchScript function should be a single IValue, got a vector of "
+            "size ",
+            stack.size());
+        markComplete(
+            std::move(ScriptResp(std::move(stack.front()))).toMessage());
+        return;
       }
 
-      TORCH_INTERNAL_ASSERT(
-          stack.size() == 1,
-          "Return value of a builtin operator or a "
-          "TorchScript function should be a single IValue, got a vector of "
-          "size ",
-          stack.size());
-      markComplete(std::move(ScriptResp(std::move(stack.front()))).toMessage());
+      // runAsync() starts in the calling thread, but may return an uncompleted
+      // future (though for non-async code, it will typically be completed).
+      // If it was async, our callback will typically be invoked by the
+      // continuation on an at::launch() thread.
+      auto jitFuture = PythonRpcHandler::getInstance()
+                           .jitCompilationUnit()
+                           ->get_function(scriptCall.qualifiedName())
+                           .runAsync(stack);
+
+      if (jitFuture->completed()) {
+        markComplete(
+            std::move(ScriptResp(std::move(jitFuture->value()))).toMessage());
+        return;
+      }
+      jitFuture->addCallback([responseFuture, messageId, jitFuture]() {
+        try {
+          Message m = ScriptResp(std::move(jitFuture->value())).toMessage();
+          m.setId(messageId);
+          responseFuture->markCompleted(std::move(m));
+        } catch (const std::exception& e) {
+          responseFuture->setError(e.what());
+        }
+      });
       return;
     }
     case MessageType::PYTHON_CALL: {
@@ -178,39 +198,62 @@ void RequestCallbackImpl::processRpc(
 
       auto ownerRRef = ctx.getOrCreateOwnerRRef(rrefId, returnType);
 
-      // TODO: make this asynchronous
-      // scriptRemoteCall is only alive within this block, use reference to
+      auto scriptRemoteCallDone =
+          [ownerRRef, rrefId, forkId, messageId, responseFuture](IValue res) {
+            ownerRRef->setValue(std::move(res));
+            if (rrefId != forkId) {
+              // Caller is a user and callee is the owner, add fork
+              //
+              // NB: rrefId == forkId is true if and only if calling remote to
+              // self. In that case both the caller and the callee will access
+              // the OwnerRRef. Hence, on the callee side (here), it should not
+              // call addForkOfOwner as it is not a fork. To allow callee to
+              // distinguish when this request is sent to self, the caller will
+              // set forkId using rrefId (OwnerRRef does not have a forkId
+              // anyway).
+              RRefContext::getInstance().addForkOfOwner(rrefId, forkId);
+            }
+            Message m = RemoteRet(rrefId, forkId).toMessage();
+            m.setId(messageId);
+            responseFuture->markCompleted(std::move(m));
+          };
+
+      // ScriptRemoteCall is only alive within this block, use reference to
       // avoid copy
       auto& stack = scriptRemoteCall.stackRef();
       if (scriptRemoteCall.hasOp()) {
         scriptRemoteCall.op()->getOperation()(stack);
+        TORCH_INTERNAL_ASSERT(
+            stack.size() == 1,
+            "Return value of a builtin operator or a "
+            "TorchScript function should be a single IValue, got a vector of "
+            "size ",
+            stack.size());
+        scriptRemoteCallDone(std::move(stack.front()));
+        return;
+      }
+
+      auto jitFuture = PythonRpcHandler::getInstance()
+                           .jitCompilationUnit()
+                           ->get_function(scriptRemoteCall.qualifiedName())
+                           .runAsync(stack);
+      if (jitFuture->completed()) {
+        scriptRemoteCallDone(jitFuture->value());
       } else {
-        PythonRpcHandler::getInstance()
-            .jitCompilationUnit()
-            ->get_function(scriptRemoteCall.qualifiedName())
-            .run(stack);
+        jitFuture->addCallback(
+            [scriptRemoteCallDone, jitFuture, responseFuture]() {
+              try {
+                scriptRemoteCallDone(jitFuture->value());
+              } catch (const std::exception& e) {
+                // TODO: the better approach here would be to allow ownerRRef to
+                // store an error (e.g. ownerRRef->setError(...), and propagate
+                // that back when the user fetches the rref contents. The client
+                // doesn't currently interpret an exception returned via this
+                // mechanism in the expected manner.
+                responseFuture->setError(e.what());
+              }
+            });
       }
-
-      TORCH_INTERNAL_ASSERT(
-          stack.size() == 1,
-          "Return value of a builtin operator or a "
-          "TorchScript function should be a single IValue, got a vector of "
-          "size ",
-          stack.size());
-
-      ownerRRef->setValue(std::move(stack.front()));
-      if (rrefId != forkId) {
-        // Caller is a user and callee is the owner, add fork
-        //
-        // NB: rrefId == forkId is true if and only if calling remote to self.
-        // In that case both the caller and the callee will access the
-        // OwnerRRef. Hence, on the callee side (here), it should not call
-        // addForkOfOwner as it is not a fork. To allow callee to distinguish
-        // when this request is sent to self, the caller will set forkId using
-        // rrefId (OwnerRRef does not have a forkId anyway).
-        ctx.addForkOfOwner(rrefId, forkId);
-      }
-      markComplete(RemoteRet(rrefId, forkId).toMessage());
       return;
     }
     case MessageType::PYTHON_REMOTE_CALL: {
