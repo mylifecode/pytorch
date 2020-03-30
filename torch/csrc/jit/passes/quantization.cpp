@@ -193,9 +193,6 @@ std::vector<Value*> getPassThroughInputs(Value* v) {
       "permute",
       "repeat_interleave",
       "relu",
-      // TODO: sort returns a tuple of Tensors, we have
-      // to extend the API to support that
-      // "sort",
   };
   if (isFunctionNode(
           n,
@@ -204,12 +201,14 @@ std::vector<Value*> getPassThroughInputs(Value* v) {
           /* call_funcs = */ _single_input_general_call_funcs,
           /* aten_funcs = */ {})) {
     return {n->input(1)};
-  } else if (isFunctionNode(
-                 n,
-                 // We don't have call functions
-                 // after inline
-                 /* call_funcs = */ {},
-                 /* aten_funcs = */ single_input_aten_funcs)) {
+  } else if (
+      isFunctionNode(
+          n,
+          // We don't have call functions
+          // after inline
+          /* call_funcs = */ {},
+          /* aten_funcs = */ single_input_aten_funcs) ||
+      n->kind() == Symbol::aten("sort") && v->offset() == 0) {
     return {n->input(0)};
   } else if (n->kind() == prim::If && n->outputs().size() == 1) {
     std::vector<Value*> inputs;
